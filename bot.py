@@ -99,7 +99,7 @@ class SheetsLedger:
                     "range": "A2",
                     "values": [
                         [
-                            '=QUERY(Transactions!A:K, "select C, sum(E) where C is not null group by C order by C label C \'Month\', sum(E) \'Net cashflow\'", 1)'
+                            '=IF(COUNT(Transactions!E2:E)=0; ""; QUERY(Transactions!A:K; "select C, sum(E) where C is not null group by C order by C label C \'Month\', sum(E) \'Net cashflow\'"; 1))'
                         ]
                     ],
                 },
@@ -108,7 +108,7 @@ class SheetsLedger:
                     "range": "D2",
                     "values": [
                         [
-                            '=QUERY(Transactions!A:K, "select F, G, sum(E) where F is not null group by F, G order by F, G label F \'Project\', G \'Category\', sum(E) \'Net cashflow\'", 1)'
+                            '=IF(COUNT(Transactions!E2:E)=0; ""; QUERY(Transactions!A:K; "select F, G, sum(E) where F is not null group by F, G order by F, G label F \'Project\', G \'Category\', sum(E) \'Net cashflow\'"; 1))'
                         ]
                     ],
                 },
@@ -117,7 +117,7 @@ class SheetsLedger:
                     "range": "H2",
                     "values": [
                         [
-                            '=QUERY(Transactions!A:K, "select B, F, G, E, H where D = \'expense\' order by B desc label B \'Date\', F \'Project\', G \'Category\', E \'Amount\', H \'Description\'", 1)'
+                            '=QUERY(Transactions!A:K; "select B, F, G, E, H where D = \'expense\' order by B desc label B \'Date\', F \'Project\', G \'Category\', E \'Amount\', H \'Description\'"; 1)'
                         ]
                     ],
                 },
