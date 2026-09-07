@@ -2,7 +2,9 @@ import asyncio
 import logging
 import os
 import re
+import secrets
 from dataclasses import dataclass
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -11,8 +13,8 @@ from zoneinfo import ZoneInfo
 import gspread
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 
 TRANSACTIONS_SHEET = "Transactions"
@@ -59,6 +61,8 @@ CURRENCY_ALIASES = {
     "THB": r"(?:thb|бат(?:а|ов)?|฿)",
 }
 CURRENCY_BY_SYMBOL = {"$": "USD", "₽": "RUB", "฿": "THB"}
+CURRENCY_CHOICES = ("RUB", "THB", "USD")
+PENDING_TTL = timedelta(hours=1)
 
 HELP_TEXT = """Пиши траты одним из форматов:
 
@@ -70,7 +74,7 @@ HELP_TEXT = """Пиши траты одним из форматов:
 `/add Дом | 1500 | Материалы | Бетон М300`
 
 Положительная сумма считается расходом. Отрицательная сумма или слово `доход` считается поступлением.
-Если валюта не указана, используется валюта по умолчанию.
+Если валюта не указана, бот попросит выбрать ее перед записью.
 
 Команды:
 /summary - краткая сводка
@@ -84,7 +88,6 @@ class Settings:
     google_sheet_id: str
     service_account_file: Path
     default_project: str
-    default_currency: str
     timezone: ZoneInfo
     allowed_user_ids: set[int]
 
@@ -97,7 +100,7 @@ class ParsedTransaction:
     description: str
     cashflow_type: str
     transaction_date: date | None
-    currency: str
+    currency: str | None
     vendor: str
     source_text: str
 
@@ -107,6 +110,15 @@ class VendorRule:
     canonical_name: str
     aliases: tuple[str, ...]
     default_category: str
+
+
+@dataclass(frozen=True)
+class PendingTransaction:
+    transaction: ParsedTransaction
+    user_name: str
+    user_id: int
+    message_id: int
+    created_at: datetime
 
 
 class SettingsError(RuntimeError):
@@ -180,9 +192,16 @@ class SheetsLedger:
             value_input_option="USER_ENTERED",
         )
 
-    def append(self, transaction: ParsedTransaction, update: Update, now: datetime) -> None:
-        message = update.effective_message
-        user = update.effective_user
+    def append(
+        self,
+        transaction: ParsedTransaction,
+        user_name: str,
+        user_id: int,
+        message_id: int,
+        now: datetime,
+    ) -> None:
+        if not transaction.currency:
+            raise ValueError("Currency must be selected before appending a transaction")
         signed_amount = -abs(transaction.amount) if transaction.cashflow_type == "expense" else abs(transaction.amount)
         transaction_date = transaction.transaction_date or now.date()
         row = [
@@ -194,9 +213,9 @@ class SheetsLedger:
             transaction.project,
             transaction.category,
             transaction.description,
-            user.full_name if user else "",
-            str(user.id) if user else "",
-            str(message.message_id) if message else "",
+            user_name,
+            str(user_id),
+            str(message_id),
             transaction.currency,
             transaction.vendor,
             transaction.source_text,
@@ -253,7 +272,6 @@ def load_settings() -> Settings:
     sheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
     service_account_file = Path(os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "credentials.json")).expanduser()
     default_project = os.getenv("DEFAULT_PROJECT", "General").strip() or "General"
-    default_currency = os.getenv("DEFAULT_CURRENCY", "RUB").strip().upper() or "RUB"
     timezone_name = os.getenv("TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow"
     allowed_user_ids = {
         int(value.strip())
@@ -276,7 +294,6 @@ def load_settings() -> Settings:
         google_sheet_id=sheet_id,
         service_account_file=service_account_file,
         default_project=default_project,
-        default_currency=default_currency,
         timezone=ZoneInfo(timezone_name),
         allowed_user_ids=allowed_user_ids,
     )
@@ -286,7 +303,6 @@ def parse_transaction(
     text: str,
     default_project: str,
     reference_date: date | None = None,
-    default_currency: str = "RUB",
     vendor_rules: list[VendorRule] | None = None,
 ) -> ParsedTransaction:
     source_text = text.strip()
@@ -305,7 +321,7 @@ def parse_transaction(
             raise ParseError("Для формата через `|` нужно минимум: проект | сумма | категория.")
         project, amount_text, category = parts[:3]
         description = " | ".join(parts[3:]).strip()
-        amount, currency, _ = _extract_money(amount_text, [], default_currency)
+        amount, currency, _ = _extract_money(amount_text, [])
         cashflow_type = _cashflow_type(raw, amount)
         vendor, vendor_category = _match_vendor(raw, rules)
         return ParsedTransaction(
@@ -320,7 +336,7 @@ def parse_transaction(
             source_text,
         )
 
-    amount, currency, money_span = _extract_money(raw, date_spans, default_currency)
+    amount, currency, money_span = _extract_money(raw, date_spans)
     vendor, vendor_category = _match_vendor(raw, rules)
     category, description = _category_and_description(raw, money_span, date_spans, vendor, vendor_category)
     cashflow_type = _cashflow_type(raw, amount)
@@ -379,8 +395,7 @@ def _resolved_date(day: int, month: int, year: int | None, reference_date: date)
 def _extract_money(
     text: str,
     excluded_spans: list[tuple[int, int]],
-    default_currency: str,
-) -> tuple[Decimal, str, tuple[int, int]]:
+) -> tuple[Decimal, str | None, tuple[int, int]]:
     number = r"[-+]?\d+(?:[\s\u00a0]\d{3})*(?:[.,]\d{1,2})?"
     aliases = "|".join(CURRENCY_ALIASES.values())
     currency_match = re.search(
@@ -419,7 +434,7 @@ def _extract_money(
         match = preferred[0]
     else:
         match = candidates[0]
-    return _to_decimal(match.group(0)), default_currency.upper(), match.span()
+    return _to_decimal(match.group(0)), None, match.span()
 
 
 def _currency_code(marker: str) -> str:
@@ -500,6 +515,25 @@ def _format_money(value: Decimal) -> str:
     return f"{value.quantize(Decimal('0.01')):,.2f}".replace(",", " ")
 
 
+def _recorded_text(transaction: ParsedTransaction) -> str:
+    sign = "-" if transaction.cashflow_type == "expense" else "+"
+    return (
+        f"Записал: {sign}{_format_money(transaction.amount)} | "
+        f"{transaction.currency} | {transaction.project} | {transaction.category}"
+        + (f" | {transaction.vendor}" if transaction.vendor else "")
+    )
+
+
+def _pending_transactions(context: ContextTypes.DEFAULT_TYPE) -> dict[str, PendingTransaction]:
+    return context.application.bot_data.setdefault("pending_transactions", {})
+
+
+def _remove_expired_pending(pending: dict[str, PendingTransaction], now: datetime) -> None:
+    expired = [key for key, item in pending.items() if now - item.created_at > PENDING_TTL]
+    for key in expired:
+        pending.pop(key, None)
+
+
 def is_allowed(settings: Settings, update: Update) -> bool:
     user = update.effective_user
     return not settings.allowed_user_ids or (user is not None and user.id in settings.allowed_user_ids)
@@ -516,31 +550,89 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def add_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
     ledger: SheetsLedger = context.application.bot_data["ledger"]
+    message = update.effective_message
+
+    if message is None:
+        return
 
     if not is_allowed(settings, update):
-        await update.message.reply_text("У тебя нет доступа к этому боту.")
+        await message.reply_text("У тебя нет доступа к этому боту.")
         return
 
     try:
         now = datetime.now(settings.timezone)
         transaction = parse_transaction(
-            update.message.text or "",
+            message.text or "",
             settings.default_project,
             now.date(),
-            settings.default_currency,
             ledger.vendor_rules(),
         )
-        ledger.append(transaction, update, now)
     except ParseError as exc:
-        await update.message.reply_text(f"{exc}\n\n/help покажет примеры.", parse_mode="Markdown")
+        await message.reply_text(f"{exc}\n\n/help покажет примеры.", parse_mode="Markdown")
         return
 
-    sign = "-" if transaction.cashflow_type == "expense" else "+"
-    await update.message.reply_text(
-        f"Записал: {sign}{_format_money(transaction.amount)} | "
-        f"{transaction.currency} | {transaction.project} | {transaction.category}"
-        + (f" | {transaction.vendor}" if transaction.vendor else "")
+    user = update.effective_user
+    if user is None:
+        return
+
+    if transaction.currency:
+        ledger.append(transaction, user.full_name, user.id, message.message_id, now)
+        await message.reply_text(_recorded_text(transaction))
+        return
+
+    pending = _pending_transactions(context)
+    _remove_expired_pending(pending, now)
+    pending_id = secrets.token_urlsafe(8)
+    pending[pending_id] = PendingTransaction(
+        transaction=transaction,
+        user_name=user.full_name,
+        user_id=user.id,
+        message_id=message.message_id,
+        created_at=now,
     )
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(currency, callback_data=f"currency:{pending_id}:{currency}") for currency in CURRENCY_CHOICES]]
+    )
+    await message.reply_text("В какой валюте эта операция?", reply_markup=keyboard)
+
+
+async def confirm_currency(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+
+    parts = (query.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "currency" or parts[2] not in CURRENCY_CHOICES:
+        await query.answer("Неизвестный выбор валюты.", show_alert=True)
+        return
+
+    pending_id, currency = parts[1], parts[2]
+    settings: Settings = context.application.bot_data["settings"]
+    now = datetime.now(settings.timezone)
+    pending = _pending_transactions(context)
+    _remove_expired_pending(pending, now)
+    item = pending.get(pending_id)
+    if item is None:
+        await query.answer()
+        await query.edit_message_text("Выбор устарел или уже использован. Отправь трату заново.")
+        return
+    if item.user_id != user.id:
+        await query.answer("Эту валюту должен выбрать автор операции.", show_alert=True)
+        return
+
+    ledger: SheetsLedger = context.application.bot_data["ledger"]
+    transaction = replace(item.transaction, currency=currency)
+    try:
+        ledger.append(transaction, item.user_name, item.user_id, item.message_id, now)
+    except Exception:
+        logging.exception("Failed to append a confirmed transaction")
+        await query.answer("Не удалось записать операцию. Попробуй еще раз.", show_alert=True)
+        return
+
+    pending.pop(pending_id, None)
+    await query.answer()
+    await query.edit_message_text(_recorded_text(transaction))
 
 
 async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -576,10 +668,12 @@ def main() -> None:
     app = Application.builder().token(settings.telegram_token).build()
     app.bot_data["settings"] = settings
     app.bot_data["ledger"] = ledger
+    app.bot_data["pending_transactions"] = {}
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("add", add_transaction))
     app.add_handler(CommandHandler("summary", summary))
+    app.add_handler(CallbackQueryHandler(confirm_currency, pattern=r"^currency:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_transaction))
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
