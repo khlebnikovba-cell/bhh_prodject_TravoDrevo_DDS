@@ -3,7 +3,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -17,6 +17,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 TRANSACTIONS_SHEET = "Transactions"
 DDS_SHEET = "DDS"
+LIBRARY_SHEET = "Library"
 TRANSACTION_HEADERS = [
     "datetime",
     "date",
@@ -29,17 +30,47 @@ TRANSACTION_HEADERS = [
     "telegram_user",
     "telegram_user_id",
     "telegram_message_id",
+    "currency",
+    "vendor",
+    "source_text",
 ]
+LIBRARY_HEADERS = ["canonical_name", "aliases", "default_category"]
+DEFAULT_LIBRARY_ROWS = [
+    ["Higgsfield", "хигсвел, хигсфилд, higgsfield", "Подписки"],
+]
+
+MONTHS = {
+    "января": 1,
+    "февраля": 2,
+    "марта": 3,
+    "апреля": 4,
+    "мая": 5,
+    "июня": 6,
+    "июля": 7,
+    "августа": 8,
+    "сентября": 9,
+    "октября": 10,
+    "ноября": 11,
+    "декабря": 12,
+}
+CURRENCY_ALIASES = {
+    "USD": r"(?:usd|доллар(?:а|ов)?|долл(?:ар(?:а|ов)?)?|\$)",
+    "RUB": r"(?:rub|руб(?:ль|ля|лей)?|₽)",
+    "THB": r"(?:thb|бат(?:а|ов)?|฿)",
+}
+CURRENCY_BY_SYMBOL = {"$": "USD", "₽": "RUB", "฿": "THB"}
 
 HELP_TEXT = """Пиши траты одним из форматов:
 
 `1500 материалы бетон М300`
 `-1500 материалы бетон М300`
 `Дом | 1500 | Материалы | Бетон М300`
+`3 сентября подписка Higgsfield на 1 месяц за 275 долларов`
 `/add 1500 материалы бетон М300`
 `/add Дом | 1500 | Материалы | Бетон М300`
 
 Положительная сумма считается расходом. Отрицательная сумма или слово `доход` считается поступлением.
+Если валюта не указана, используется валюта по умолчанию.
 
 Команды:
 /summary - краткая сводка
@@ -53,6 +84,7 @@ class Settings:
     google_sheet_id: str
     service_account_file: Path
     default_project: str
+    default_currency: str
     timezone: ZoneInfo
     allowed_user_ids: set[int]
 
@@ -64,6 +96,17 @@ class ParsedTransaction:
     category: str
     description: str
     cashflow_type: str
+    transaction_date: date | None
+    currency: str
+    vendor: str
+    source_text: str
+
+
+@dataclass(frozen=True)
+class VendorRule:
+    canonical_name: str
+    aliases: tuple[str, ...]
+    default_category: str
 
 
 class SettingsError(RuntimeError):
@@ -72,6 +115,10 @@ class SettingsError(RuntimeError):
 
 class ParseError(ValueError):
     pass
+
+
+def _library_is_empty(rows: list[list[str]]) -> bool:
+    return not any(row and str(row[0]).strip() for row in rows[1:])
 
 
 class SheetsLedger:
@@ -88,8 +135,15 @@ class SheetsLedger:
         first_row = transactions.row_values(1)
         if first_row != TRANSACTION_HEADERS:
             transactions.resize(rows=max(transactions.row_count, 1000), cols=len(TRANSACTION_HEADERS))
-            transactions.update("A1:K1", [TRANSACTION_HEADERS])
+            transactions.update("A1:N1", [TRANSACTION_HEADERS])
             transactions.freeze(rows=1)
+
+        library = self._worksheet(LIBRARY_SHEET)
+        if library.row_values(1) != LIBRARY_HEADERS:
+            library.update("A1:C1", [LIBRARY_HEADERS])
+            library.freeze(rows=1)
+        if _library_is_empty(library.get_all_values()):
+            library.append_rows(DEFAULT_LIBRARY_ROWS, value_input_option="RAW")
 
         dds = self._worksheet(DDS_SHEET)
         dds.clear()
@@ -100,7 +154,7 @@ class SheetsLedger:
                     "range": "A2",
                     "values": [
                         [
-                            '=IF(COUNT(Transactions!E2:E)=0; ""; QUERY(Transactions!A:K; "select C, sum(E) where C is not null group by C order by C label C \'Month\', sum(E) \'Net cashflow\'"; 1))'
+                            '=IF(COUNT(Transactions!E2:E)=0; ""; QUERY(Transactions!A:N; "select C, L, sum(E) where C is not null group by C, L order by C, L label C \'Month\', L \'Currency\', sum(E) \'Net cashflow\'"; 1))'
                         ]
                     ],
                 },
@@ -109,7 +163,7 @@ class SheetsLedger:
                     "range": "D2",
                     "values": [
                         [
-                            '=IF(COUNT(Transactions!E2:E)=0; ""; QUERY(Transactions!A:K; "select F, G, sum(E) where F is not null group by F, G order by F, G label F \'Project\', G \'Category\', sum(E) \'Net cashflow\'"; 1))'
+                            '=IF(COUNT(Transactions!E2:E)=0; ""; QUERY(Transactions!A:N; "select F, G, L, sum(E) where F is not null group by F, G, L order by F, G, L label F \'Project\', G \'Category\', L \'Currency\', sum(E) \'Net cashflow\'"; 1))'
                         ]
                     ],
                 },
@@ -118,7 +172,7 @@ class SheetsLedger:
                     "range": "H2",
                     "values": [
                         [
-                            '=QUERY(Transactions!A:K; "select B, F, G, E, H where D = \'expense\' order by B desc label B \'Date\', F \'Project\', G \'Category\', E \'Amount\', H \'Description\'"; 1)'
+                            '=QUERY(Transactions!A:N; "select B, F, G, M, E, L, H where D = \'expense\' order by B desc label B \'Date\', F \'Project\', G \'Category\', M \'Vendor\', E \'Amount\', L \'Currency\', H \'Description\'"; 1)'
                         ]
                     ],
                 },
@@ -130,10 +184,11 @@ class SheetsLedger:
         message = update.effective_message
         user = update.effective_user
         signed_amount = -abs(transaction.amount) if transaction.cashflow_type == "expense" else abs(transaction.amount)
+        transaction_date = transaction.transaction_date or now.date()
         row = [
             now.isoformat(timespec="seconds"),
-            now.strftime("%Y-%m-%d"),
-            now.strftime("%Y-%m"),
+            transaction_date.isoformat(),
+            transaction_date.strftime("%Y-%m"),
             transaction.cashflow_type,
             str(signed_amount),
             transaction.project,
@@ -142,20 +197,48 @@ class SheetsLedger:
             user.full_name if user else "",
             str(user.id) if user else "",
             str(message.message_id) if message else "",
+            transaction.currency,
+            transaction.vendor,
+            transaction.source_text,
         ]
         self._worksheet(TRANSACTIONS_SHEET).append_row(row, value_input_option="USER_ENTERED")
 
-    def totals(self) -> tuple[Decimal, Decimal, Decimal]:
+    def totals(self) -> dict[str, tuple[Decimal, Decimal, Decimal]]:
         rows = self._worksheet(TRANSACTIONS_SHEET).get_all_records()
-        income = Decimal("0")
-        expense = Decimal("0")
+        totals: dict[str, list[Decimal]] = {}
         for row in rows:
             amount = _to_decimal(str(row.get("amount", 0)))
+            currency = str(row.get("currency") or "RUB").upper()
+            income, expense = totals.setdefault(currency, [Decimal("0"), Decimal("0")])
             if amount >= 0:
-                income += amount
+                totals[currency][0] = income + amount
             else:
-                expense += amount
-        return income, expense, income + expense
+                totals[currency][1] = expense + amount
+        return {
+            currency: (income, expense, income + expense)
+            for currency, (income, expense) in totals.items()
+        }
+
+    def vendor_rules(self) -> list[VendorRule]:
+        rows = self._worksheet(LIBRARY_SHEET).get_all_records()
+        rules = []
+        for row in rows:
+            canonical_name = str(row.get("canonical_name", "")).strip()
+            if not canonical_name:
+                continue
+            aliases = tuple(
+                alias.strip().lower()
+                for alias in re.split(r"[,;]", str(row.get("aliases", "")))
+                if alias.strip()
+            )
+            rules.append(
+                VendorRule(
+                    canonical_name=canonical_name,
+                    aliases=(canonical_name.lower(), *aliases),
+                    default_category=str(row.get("default_category", "")).strip() or "Прочее",
+                )
+            )
+        return rules
 
     def _worksheet(self, title: str):
         try:
@@ -170,6 +253,7 @@ def load_settings() -> Settings:
     sheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
     service_account_file = Path(os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "credentials.json")).expanduser()
     default_project = os.getenv("DEFAULT_PROJECT", "General").strip() or "General"
+    default_currency = os.getenv("DEFAULT_CURRENCY", "RUB").strip().upper() or "RUB"
     timezone_name = os.getenv("TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow"
     allowed_user_ids = {
         int(value.strip())
@@ -192,16 +276,28 @@ def load_settings() -> Settings:
         google_sheet_id=sheet_id,
         service_account_file=service_account_file,
         default_project=default_project,
+        default_currency=default_currency,
         timezone=ZoneInfo(timezone_name),
         allowed_user_ids=allowed_user_ids,
     )
 
 
-def parse_transaction(text: str, default_project: str) -> ParsedTransaction:
-    raw = text.strip()
+def parse_transaction(
+    text: str,
+    default_project: str,
+    reference_date: date | None = None,
+    default_currency: str = "RUB",
+    vendor_rules: list[VendorRule] | None = None,
+) -> ParsedTransaction:
+    source_text = text.strip()
+    raw = source_text
     raw = re.sub(r"^/add(?:@\w+)?\s*", "", raw, flags=re.IGNORECASE)
     if not raw:
         raise ParseError("Не вижу сумму и категорию.")
+
+    reference_date = reference_date or date.today()
+    transaction_date, date_spans = _extract_date(raw, reference_date)
+    rules = vendor_rules or []
 
     if "|" in raw:
         parts = [part.strip() for part in raw.split("|")]
@@ -209,32 +305,180 @@ def parse_transaction(text: str, default_project: str) -> ParsedTransaction:
             raise ParseError("Для формата через `|` нужно минимум: проект | сумма | категория.")
         project, amount_text, category = parts[:3]
         description = " | ".join(parts[3:]).strip()
-        amount = _to_decimal(amount_text)
+        amount, currency, _ = _extract_money(amount_text, [], default_currency)
         cashflow_type = _cashflow_type(raw, amount)
-        return ParsedTransaction(abs(amount), project or default_project, category, description, cashflow_type)
+        vendor, vendor_category = _match_vendor(raw, rules)
+        return ParsedTransaction(
+            abs(amount),
+            project or default_project,
+            vendor_category or category,
+            description,
+            cashflow_type,
+            transaction_date,
+            currency,
+            vendor,
+            source_text,
+        )
 
-    normalized = raw.replace(",", ".")
-    match = re.search(r"[-+]?\d+(?:\.\d{1,2})?", normalized)
-    if not match:
-        raise ParseError("Не нашел сумму. Пример: `1500 материалы бетон`.")
-
-    amount = _to_decimal(match.group(0))
-    before = normalized[: match.start()].strip()
-    after = normalized[match.end() :].strip()
-    words = after.split()
-    if not words:
-        raise ParseError("После суммы укажи категорию. Пример: `1500 материалы бетон`.")
-
-    project = default_project
-    if before:
-        before_words = [word for word in before.split() if word.lower() not in {"доход", "поступление", "расход", "трата"}]
-        if before_words:
-            project = " ".join(before_words)
-
-    category = words[0]
-    description = " ".join(words[1:])
+    amount, currency, money_span = _extract_money(raw, date_spans, default_currency)
+    vendor, vendor_category = _match_vendor(raw, rules)
+    category, description = _category_and_description(raw, money_span, date_spans, vendor, vendor_category)
     cashflow_type = _cashflow_type(raw, amount)
-    return ParsedTransaction(abs(amount), project, category, description, cashflow_type)
+    return ParsedTransaction(
+        abs(amount),
+        default_project,
+        category,
+        description,
+        cashflow_type,
+        transaction_date,
+        currency,
+        vendor,
+        source_text,
+    )
+
+
+def _extract_date(text: str, reference_date: date) -> tuple[date | None, list[tuple[int, int]]]:
+    lowered = text.lower()
+    relative = re.search(r"\b(сегодня|вчера)\b", lowered)
+    if relative:
+        days = 1 if relative.group(1) == "вчера" else 0
+        return reference_date - timedelta(days=days), [relative.span()]
+
+    month_names = "|".join(MONTHS)
+    written = re.search(rf"(?<!\d)(\d{{1,2}})\s+({month_names})(?:\s+(\d{{4}}))?\b", lowered)
+    if written:
+        parsed = _resolved_date(
+            int(written.group(1)),
+            MONTHS[written.group(2)],
+            int(written.group(3)) if written.group(3) else None,
+            reference_date,
+        )
+        return parsed, [written.span()]
+
+    numeric = re.search(r"(?<!\d)(\d{1,2})[./](\d{1,2})(?:[./](\d{2}|\d{4}))?(?!\d)", lowered)
+    if numeric:
+        year_text = numeric.group(3)
+        year = None if year_text is None else int(year_text)
+        if year is not None and year < 100:
+            year += 2000
+        parsed = _resolved_date(int(numeric.group(1)), int(numeric.group(2)), year, reference_date)
+        return parsed, [numeric.span()]
+    return None, []
+
+
+def _resolved_date(day: int, month: int, year: int | None, reference_date: date) -> date:
+    try:
+        parsed = date(year or reference_date.year, month, day)
+    except ValueError as exc:
+        raise ParseError("Не смог прочитать дату в сообщении.") from exc
+    if year is None and parsed > reference_date:
+        parsed = parsed.replace(year=parsed.year - 1)
+    return parsed
+
+
+def _extract_money(
+    text: str,
+    excluded_spans: list[tuple[int, int]],
+    default_currency: str,
+) -> tuple[Decimal, str, tuple[int, int]]:
+    number = r"[-+]?\d+(?:[\s\u00a0]\d{3})*(?:[.,]\d{1,2})?"
+    aliases = "|".join(CURRENCY_ALIASES.values())
+    currency_match = re.search(
+        rf"(?<!\w)(?:(?P<symbol>[$₽฿])\s*(?P<prefix_amount>{number})|(?P<amount>{number})\s*(?P<currency>{aliases}))(?!\w)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if currency_match:
+        amount_text = currency_match.group("prefix_amount") or currency_match.group("amount")
+        marker = currency_match.group("symbol") or currency_match.group("currency") or ""
+        return _to_decimal(amount_text), _currency_code(marker), currency_match.span()
+
+    masked = list(text)
+    duration_spans = [
+        match.span()
+        for match in re.finditer(
+            r"(?<!\d)\d+(?:[.,]\d+)?\s*(?:дн(?:я|ей)?|недел(?:я|и|ь)|месяц(?:а|ев)?|год(?:а|ов)?)(?!\w)",
+            text,
+            flags=re.IGNORECASE,
+        )
+    ]
+    for start, end in [*excluded_spans, *duration_spans]:
+        masked[start:end] = " " * (end - start)
+    masked_text = "".join(masked)
+    candidates = list(re.finditer(rf"(?<!\w){number}(?!\w)", masked_text))
+    if not candidates:
+        raise ParseError("Не нашел сумму. Пример: `1500 материалы бетон`.")
+    if len(candidates) > 1:
+        preferred = [
+            match
+            for match in candidates
+            if re.search(r"(?:за|оплатил(?:а)?|стоимость)\s*$", masked_text[: match.start()], re.IGNORECASE)
+        ]
+        if len(preferred) != 1:
+            raise ParseError("Вижу несколько чисел и не понимаю сумму. Укажи валюту, например `275 USD`.")
+        match = preferred[0]
+    else:
+        match = candidates[0]
+    return _to_decimal(match.group(0)), default_currency.upper(), match.span()
+
+
+def _currency_code(marker: str) -> str:
+    marker = marker.strip().lower()
+    if marker in CURRENCY_BY_SYMBOL:
+        return CURRENCY_BY_SYMBOL[marker]
+    for code, pattern in CURRENCY_ALIASES.items():
+        if re.fullmatch(pattern, marker, flags=re.IGNORECASE):
+            return code
+    return "RUB"
+
+
+def _match_vendor(text: str, rules: list[VendorRule]) -> tuple[str, str]:
+    lowered = text.lower()
+    for rule in rules:
+        if any(re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", lowered) for alias in rule.aliases):
+            return rule.canonical_name, rule.default_category
+    if re.search(r"\b(?:тариф|тарифа|подписк\w*|сервис\w*|сайт\w*)\b", lowered):
+        candidate = re.search(
+            r"\b(?:на|в)\s+([a-zа-я0-9._-]+)(?=\s*(?:[-—–]|$))",
+            text,
+            re.IGNORECASE,
+        )
+        if candidate:
+            return candidate.group(1), "Подписки"
+    return "", ""
+
+
+def _category_and_description(
+    text: str,
+    money_span: tuple[int, int],
+    date_spans: list[tuple[int, int]],
+    vendor: str,
+    vendor_category: str,
+) -> tuple[str, str]:
+    if vendor_category:
+        plan_match = re.search(r"\bтариф[а]?\s+([a-zа-я0-9._-]+)", text, re.IGNORECASE)
+        duration_match = re.search(
+            r"(?<!\d)(\d+(?:[.,]\d+)?)\s*(дн(?:я|ей)?|недел(?:я|и|ь)|месяц(?:а|ев)?|год(?:а|ов)?)",
+            text,
+            re.IGNORECASE,
+        )
+        parts = []
+        if plan_match:
+            plan = plan_match.group(1)
+            plan = "Ultra" if plan.lower() == "ультра" else plan.capitalize()
+            parts.append(f"Тариф {plan}")
+        if duration_match:
+            parts.append(f"{duration_match.group(1)} {duration_match.group(2).lower()}")
+        return vendor_category, ", ".join(parts) or f"Оплата {vendor}"
+
+    remaining = list(text)
+    for start, end in [money_span, *date_spans]:
+        remaining[start:end] = " " * (end - start)
+    words = "".join(remaining).strip(" -—–,.").split()
+    words = [word for word in words if word.lower() not in {"доход", "поступление", "приход", "расход", "трата"}]
+    if not words:
+        raise ParseError("Укажи категорию. Пример: `1500 материалы бетон`.")
+    return words[0], " ".join(words[1:])
 
 
 def _cashflow_type(text: str, amount: Decimal) -> str:
@@ -278,8 +522,14 @@ async def add_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     try:
-        transaction = parse_transaction(update.message.text or "", settings.default_project)
         now = datetime.now(settings.timezone)
+        transaction = parse_transaction(
+            update.message.text or "",
+            settings.default_project,
+            now.date(),
+            settings.default_currency,
+            ledger.vendor_rules(),
+        )
         ledger.append(transaction, update, now)
     except ParseError as exc:
         await update.message.reply_text(f"{exc}\n\n/help покажет примеры.", parse_mode="Markdown")
@@ -288,7 +538,8 @@ async def add_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     sign = "-" if transaction.cashflow_type == "expense" else "+"
     await update.message.reply_text(
         f"Записал: {sign}{_format_money(transaction.amount)} | "
-        f"{transaction.project} | {transaction.category}"
+        f"{transaction.currency} | {transaction.project} | {transaction.category}"
+        + (f" | {transaction.vendor}" if transaction.vendor else "")
     )
 
 
@@ -300,13 +551,19 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("У тебя нет доступа к этому боту.")
         return
 
-    income, expense, balance = ledger.totals()
-    await update.message.reply_text(
-        "Сводка по таблице:\n"
-        f"Доходы: {_format_money(income)}\n"
-        f"Расходы: {_format_money(abs(expense))}\n"
-        f"Баланс: {_format_money(balance)}"
-    )
+    totals = ledger.totals()
+    if not totals:
+        await update.message.reply_text("В таблице пока нет операций.")
+        return
+    blocks = ["Сводка по таблице:"]
+    for currency, (income, expense, balance) in sorted(totals.items()):
+        blocks.append(
+            f"\n{currency}\n"
+            f"Доходы: {_format_money(income)}\n"
+            f"Расходы: {_format_money(abs(expense))}\n"
+            f"Баланс: {_format_money(balance)}"
+        )
+    await update.message.reply_text("\n".join(blocks))
 
 
 def main() -> None:
