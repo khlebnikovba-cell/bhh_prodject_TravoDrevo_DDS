@@ -19,6 +19,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 TRANSACTIONS_SHEET = "Transactions"
 DDS_SHEET = "DDS"
+SUMMARY_SHEET = "Summary"
 LIBRARY_SHEET = "Library"
 TRANSACTION_HEADERS = [
     "datetime",
@@ -39,6 +40,37 @@ TRANSACTION_HEADERS = [
 LIBRARY_HEADERS = ["canonical_name", "aliases", "default_category"]
 DEFAULT_LIBRARY_ROWS = [
     ["Higgsfield", "хигсвел, хигсфилд, higgsfield", "Подписки"],
+]
+DDS_LAYOUT = [
+    {"range": "A1", "values": [["Cashflow journal"]]},
+    {
+        "range": "A2",
+        "values": [
+            [
+                '=IF(COUNT(Transactions!E2:E)=0; ""; QUERY(Transactions!A:N; "select B, D, F, G, M, E, L, H where B is not null order by B desc label B \'Date\', D \'Type\', F \'Project\', G \'Category\', M \'Vendor\', E \'Amount\', L \'Currency\', H \'Description\'"; 1))'
+            ]
+        ],
+    },
+]
+SUMMARY_LAYOUT = [
+    {"range": "A1", "values": [["Monthly net cashflow"]]},
+    {
+        "range": "A2",
+        "values": [
+            [
+                '=IF(COUNT(Transactions!E2:E)=0; ""; QUERY(Transactions!A:N; "select C, L, sum(E) where C is not null group by C, L order by C, L label C \'Month\', L \'Currency\', sum(E) \'Net cashflow\'"; 1))'
+            ]
+        ],
+    },
+    {"range": "F1", "values": [["Project / category cashflow"]]},
+    {
+        "range": "F2",
+        "values": [
+            [
+                '=IF(COUNT(Transactions!E2:E)=0; ""; QUERY(Transactions!A:N; "select F, G, L, sum(E) where F is not null group by F, G, L order by F, G, L label F \'Project\', G \'Category\', L \'Currency\', sum(E) \'Net cashflow\'"; 1))'
+            ]
+        ],
+    },
 ]
 
 MONTHS = {
@@ -159,38 +191,11 @@ class SheetsLedger:
 
         dds = self._worksheet(DDS_SHEET)
         dds.clear()
-        dds.batch_update(
-            [
-                {"range": "A1", "values": [["Monthly net cashflow"]]},
-                {
-                    "range": "A2",
-                    "values": [
-                        [
-                            '=IF(COUNT(Transactions!E2:E)=0; ""; QUERY(Transactions!A:N; "select C, L, sum(E) where C is not null group by C, L order by C, L label C \'Month\', L \'Currency\', sum(E) \'Net cashflow\'"; 1))'
-                        ]
-                    ],
-                },
-                {"range": "D1", "values": [["Project / category cashflow"]]},
-                {
-                    "range": "D2",
-                    "values": [
-                        [
-                            '=IF(COUNT(Transactions!E2:E)=0; ""; QUERY(Transactions!A:N; "select F, G, L, sum(E) where F is not null group by F, G, L order by F, G, L label F \'Project\', G \'Category\', L \'Currency\', sum(E) \'Net cashflow\'"; 1))'
-                        ]
-                    ],
-                },
-                {"range": "H1", "values": [["Raw expenses only"]]},
-                {
-                    "range": "H2",
-                    "values": [
-                        [
-                            '=QUERY(Transactions!A:N; "select B, F, G, M, E, L, H where D = \'expense\' order by B desc label B \'Date\', F \'Project\', G \'Category\', M \'Vendor\', E \'Amount\', L \'Currency\', H \'Description\'"; 1)'
-                        ]
-                    ],
-                },
-            ],
-            value_input_option="USER_ENTERED",
-        )
+        dds.batch_update(DDS_LAYOUT, value_input_option="USER_ENTERED")
+
+        summary = self._worksheet(SUMMARY_SHEET)
+        summary.clear()
+        summary.batch_update(SUMMARY_LAYOUT, value_input_option="USER_ENTERED")
 
     def append(
         self,

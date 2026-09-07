@@ -6,7 +6,9 @@ from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 from bot import (
+    DDS_LAYOUT,
     ParseError,
+    SUMMARY_LAYOUT,
     Settings,
     VendorRule,
     _library_is_empty,
@@ -107,6 +109,23 @@ class LibraryLayoutTests(unittest.TestCase):
                 ]
             )
         )
+
+
+class GeneratedSheetLayoutTests(unittest.TestCase):
+    def test_dds_contains_only_one_cashflow_journal_query(self):
+        self.assertEqual([update["range"] for update in DDS_LAYOUT], ["A1", "A2"])
+        formula = DDS_LAYOUT[1]["values"][0][0]
+        self.assertIn("select B, D, F, G, M, E, L, H", formula)
+        self.assertNotIn("where D = 'expense'", formula)
+        self.assertNotIn("sum(E)", formula)
+
+    def test_summary_blocks_are_separated(self):
+        self.assertEqual(
+            [update["range"] for update in SUMMARY_LAYOUT],
+            ["A1", "A2", "F1", "F2"],
+        )
+        self.assertIn("select C, L, sum(E)", SUMMARY_LAYOUT[1]["values"][0][0])
+        self.assertIn("select F, G, L, sum(E)", SUMMARY_LAYOUT[3]["values"][0][0])
 
 
 class FakeLedger:
