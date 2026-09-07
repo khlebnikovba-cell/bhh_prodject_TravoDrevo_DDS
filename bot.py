@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import re
@@ -310,6 +311,7 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     settings = load_settings()
     ledger = SheetsLedger(settings)
     ledger.ensure_layout()
@@ -322,7 +324,13 @@ def main() -> None:
     app.add_handler(CommandHandler("add", add_transaction))
     app.add_handler(CommandHandler("summary", summary))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_transaction))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
 
 
 if __name__ == "__main__":
